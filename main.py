@@ -5,6 +5,8 @@ import os
 import re
 import hashlib
 import time
+import zipfile
+import io
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from aiohttp import web
@@ -12,7 +14,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton as TelegramInlineKeyboardButton, ReplyKeyboardRemove
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton as TelegramInlineKeyboardButton, ReplyKeyboardRemove, BufferedInputFile, BotCommand
 )
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
@@ -78,9 +80,14 @@ else:
     # OWNER_ID bo'sh qolgan bo'lsa, ADMIN_ID dagi birinchi ID egasi sifatida olinadi.
     OWNER_ID = ADMIN_IDS[0] if ADMIN_IDS else 0
 DATA_FILE = Path(os.getenv("DATA_FILE", "data.json"))
+BACKUP_CHANNEL_ID = os.getenv("BACKUP_CHANNEL_ID", "").strip()
 ADMIN_CONTACT = "@AnimBot_Admin"
 # media postlari saqlanadigan kanal ID sini STORAGE_CHANNEL_ID environment variable orqali berish mumkin.
 CHANNEL_ID = os.getenv("STORAGE_CHANNEL_ID", "").strip()
+
+def get_backup_channel_id():
+    """Owner panelidagi kanal sozlamasi ENV qiymatidan ustun turadi."""
+    return str(load_data().get("settings", {}).get("backup_channel_id") or BACKUP_CHANNEL_ID or "").strip()
 # =================================================
 
 logging.basicConfig(level=logging.INFO)
@@ -134,6 +141,27 @@ class StyledBot(Bot):
 bot = StyledBot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
+class MaintenanceMiddleware:
+    """Texnik tanaffusda ownerdan boshqalarning so'rovlarini to'xtatadi."""
+    async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        if user and not is_owner(user.id):
+            cfg = load_data().get("settings", {})
+            if cfg.get("maintenance", False):
+                message = getattr(event, "message", None) or event
+                try:
+                    if isinstance(event, CallbackQuery):
+                        await event.answer("🛠 Botda texnik ishlar ketmoqda. Keyinroq urinib ko'ring.", show_alert=True)
+                    elif isinstance(event, Message):
+                        await event.answer("🛠 <b>Texnik tanaffus</b>\nBot yangilanmoqda. Iltimos, keyinroq urinib ko'ring.")
+                except Exception:
+                    pass
+                return None
+        return await handler(event, data)
+
+dp.message.outer_middleware(MaintenanceMiddleware())
+dp.callback_query.outer_middleware(MaintenanceMiddleware())
+
 
 def default_data():
     return {
@@ -144,7 +172,7 @@ def default_data():
         "channel_catalog": {},
         "users": {},
         "banned_users": [],
-        "settings": {"catalog_channel_id": "", "button_colors": {}, "button_texts": {}}
+        "settings": {"catalog_channel_id": "", "button_colors": {}, "button_texts": {}, "maintenance": False, "vip_enabled": False, "vip_month_price": 15000, "vip_max_months": 6, "vip_duration_days": 30, "early_view_days": 1, "referral_reward": 5000, "notify_new_content": True, "admin_contact": "obidov_xz", "ordinary_base_status": "sozlanmagan", "vip_base_status": "sozlanmagan"}
     }
 
 
@@ -313,10 +341,15 @@ async def send_start(message: Message, user_id=None):
 
 
 def main_menu(user_id=None):
-    return InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [InlineKeyboardButton(text="🎬 Kino va serial izlash", callback_data="search_menu")],
         [InlineKeyboardButton(text="📖 Qo'llanma", callback_data="guide")],
-    ])
+    ]
+    if load_data().get("settings", {}).get("vip_enabled", False):
+        rows.insert(1, [InlineKeyboardButton(text="💎 VIP olish", callback_data="vip_buy")])
+        rows.insert(2, [InlineKeyboardButton(text="❓ VIP o'zi nima?", callback_data="vip_info")])
+        rows.append([InlineKeyboardButton(text="👤 Hisobim", callback_data="account")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def main_reply_keyboard():
@@ -327,7 +360,7 @@ def main_reply_keyboard():
 def search_menu(user_id=None):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎞 Kino", callback_data="category:movie"), InlineKeyboardButton(text="📺 Serial", callback_data="category:series")],
-        [InlineKeyboardButton(text="🎭 Drama", callback_data="category:drama")],
+        [InlineKeyboardButton(text="🍥 Anime", callback_data="category:anime"), InlineKeyboardButton(text="🎨 Multfilm", callback_data="category:cartoon")],
         [InlineKeyboardButton(text="🔢 Kod bo'yicha qidirish", callback_data="search"), InlineKeyboardButton(text="🔠 Nom bo'yicha qidirish", callback_data="search_name")],
         [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")],
     ])
@@ -341,26 +374,39 @@ def admin_menu(user_id=None):
         perms = {"add_content", "add_episode", "edit_content", "delete_content"}
     rows = []
     if "add_content" in perms:
-        rows.append([InlineKeyboardButton(text="➕ Kino / serial / drama qo'shish", callback_data="add_movie"), InlineKeyboardButton(text="➕ Serial / drama qo'shish", callback_data="add_series")])
+        rows.append([InlineKeyboardButton(text="➕ Kino qo'shish", callback_data="newtype:movie"), InlineKeyboardButton(text="➕ Serial qo'shish", callback_data="newtype:series")])
+        rows.append([InlineKeyboardButton(text="🍥 Anime qo'shish", callback_data="newtype:anime"), InlineKeyboardButton(text="🎨 Multfilm qo'shish", callback_data="newtype:cartoon")])
+    # Admin panelida qism/fasl qo'shish tugmasi alohida ko'rsatiladi.
     if "add_episode" in perms:
-        rows.append([InlineKeyboardButton(text="➕ Qism / yangi sezon qo'shish", callback_data="add_episode")])
+        rows.append([InlineKeyboardButton(text="➕ Qism / yangi fasl qo'shish", callback_data="add_episode")])
     if "edit_content" in perms:
-        rows.append([InlineKeyboardButton(text="✏️ Nomi / posteri tahrirlash", callback_data="rename_media")])
+        rows.append([InlineKeyboardButton(text="✏️ Nomini o'zgartirish", callback_data="rename_media"), InlineKeyboardButton(text="🖼 Posterni o'zgartirish", callback_data="edit_poster")])
+        rows.append([InlineKeyboardButton(text="🔢 Kodini o'zgartirish", callback_data="rename_code")])
     if "delete_content" in perms:
-        rows.append([InlineKeyboardButton(text="🗑 Kino yoki serial o'chirish", callback_data="del_media")])
+        rows.append([InlineKeyboardButton(text="🗑 Kontent o'chirish", callback_data="del_media")])
+        rows.append([InlineKeyboardButton(text="🗑 Qism o'chirish", callback_data="del_episode"), InlineKeyboardButton(text="🗑 Fasl o'chirish", callback_data="del_season")])
     return InlineKeyboardMarkup(inline_keyboard=rows or [[InlineKeyboardButton(text="⛔ Sizga huquq berilmagan", callback_data="admin_home")]])
 
 
 def owner_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Kino / drama qo'shish", callback_data="add_movie"), InlineKeyboardButton(text="➕ Serial qo'shish", callback_data="add_series")],
+        [InlineKeyboardButton(text="➕ Kino qo'shish", callback_data="add_movie"), InlineKeyboardButton(text="➕ Serial qo'shish", callback_data="add_series")],
+        [InlineKeyboardButton(text="🍥 Anime qo'shish", callback_data="newtype:anime"), InlineKeyboardButton(text="🎨 Multfilm qo'shish", callback_data="newtype:cartoon")],
         [InlineKeyboardButton(text="➕ Qism yoki yangi sezon", callback_data="add_episode"), InlineKeyboardButton(text="🗑 Kontent o'chirish", callback_data="del_media")],
+        [InlineKeyboardButton(text="🗑 Fasl o'chirish", callback_data="del_season")],
         [InlineKeyboardButton(text="✏️ Nom / kodni tahrirlash", callback_data="rename_media"), InlineKeyboardButton(text="🖼 Posterni tahrirlash", callback_data="edit_poster")],
         [InlineKeyboardButton(text="👤 Admin qo'shish", callback_data="add_admin"), InlineKeyboardButton(text="➖ Admin o'chirish", callback_data="del_admin")],
         [InlineKeyboardButton(text="🔐 Admin huquqlarini sozlash", callback_data="admin_permissions")],
         [InlineKeyboardButton(text="📢 Kanal qo'shish", callback_data="add_channel"), InlineKeyboardButton(text="➖ Kanal o'chirish", callback_data="del_channel")],
         [InlineKeyboardButton(text="🎨 Tugma ranglari", callback_data="appearance")],
-        [InlineKeyboardButton(text="📚 Baza kanalini belgilash", callback_data="setcfg:catalog_channel_id")],
+        [InlineKeyboardButton(text="💾 Zaxira olish", callback_data="owner_backup"), InlineKeyboardButton(text="♻️ Zaxirani tiklash", callback_data="owner_restore_help")],
+        [InlineKeyboardButton(text="🗄 Zaxira kanalini o'zgartirish", callback_data="backup_channel_change")],
+        [InlineKeyboardButton(text="🛠 Texnik tanaffus: holat", callback_data="owner_maintenance")],
+        [InlineKeyboardButton(text=("💎 VIP: O'CHIRISH" if load_data().get("settings", {}).get("vip_enabled", False) else "💎 VIP: YOQISH"), callback_data="owner_vip")],
+        [InlineKeyboardButton(text="📣 Hammaga xabar yuborish", callback_data="broadcast")],
+        [InlineKeyboardButton(text="⚙️ Bot sozlamalari", callback_data="owner_settings")],
+        [InlineKeyboardButton(text="📊 Statistika", callback_data="stats")],
+        [InlineKeyboardButton(text=("📣 Yangi kontent xabari: YOQILGAN" if load_data().get("settings", {}).get("notify_new_content", True) else "📣 Yangi kontent xabari: O‘CHIRILGAN"), callback_data="owner_notify_toggle")],
     ])
 
 
@@ -381,7 +427,7 @@ def catalog_item_for_media(data: dict, media: dict):
     return None, None
 
 
-def episode_keyboard(code: str, episodes: dict, catalog_key=None, catalog_item=None, user_id=None, season="1", media=None):
+def episode_keyboard(code: str, episodes: dict, catalog_key=None, catalog_item=None, user_id=None, season="1", media=None, page=0):
     """Qismlar faqat 1, 2, 3 ko‘rinishida; ko‘p faslda avval fasl tanlanadi."""
     rows, row = [], []
     media = media or {}
@@ -418,12 +464,24 @@ def episode_keyboard(code: str, episodes: dict, catalog_key=None, catalog_item=N
                 # Eski bitta-bazali format faqat ikki baza sozlanmagan holatda ishlaydi.
                 available_numbers.append(number)
         sorted_numbers = sorted(available_numbers, key=sort_key)
-        # 1-qism tugmasi birinchi bo'lib chiqadi, foydalanuvchi darhol boshlashi mumkin.
-        for number in sorted_numbers:
+        # Har sahifada 25 ta qism; qolganlari keyingi sahifaga o'tadi.
+        total_pages = max(1, (len(sorted_numbers) + 24) // 25)
+        page = max(0, min(int(page), total_pages - 1))
+        page_numbers = sorted_numbers[page * 25:(page + 1) * 25]
+        # 1-qism tugmasi birinchi bo'lib chiqadi.
+        for number in page_numbers:
             row.append(InlineKeyboardButton(text=("▶️ Tomosha qilish" if media.get("media_type") == "movie" else ("▶️ 1-qism" if str(number) == "1" else str(number))), callback_data=f"episode:{code}:{season}:{number}"))
             if len(row) == 5:
                 rows.append(row); row=[]
         if row: rows.append(row)
+        if total_pages > 1:
+            pager = []
+            if page > 0:
+                pager.append(InlineKeyboardButton(text="⬅️ Orqaga", callback_data=f"season_page:{code}:{season}:{page-1}"))
+            pager.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="page_info"))
+            if page < total_pages - 1:
+                pager.append(InlineKeyboardButton(text="Oldinga ➡️", callback_data=f"season_page:{code}:{season}:{page+1}"))
+            rows.append(pager)
         if len(season_keys) > 1:
             rows.append([InlineKeyboardButton(text="⬅️ Fasllar", callback_data=f"season_show:{code}:choose")])
     rows.append([InlineKeyboardButton(text="♥️ Sevimlilarga qo‘shish", callback_data=f"favorite_add:{code}")])
@@ -433,7 +491,7 @@ def episode_keyboard(code: str, episodes: dict, catalog_key=None, catalog_item=N
 
 def media_caption(code: str, media: dict) -> str:
     description = (media.get("description") or "").strip()
-    kind = {"movie":"🎞 Kino", "series":"📺 Serial", "drama":"🎭 Drama"}.get(media.get("media_type"), "🎬 Kontent")
+    kind = {"movie":"🎞 Kino", "series":"📺 Serial", "drama":"🎭 Drama", "anime":"🍥 Anime", "cartoon":"🎨 Multfilm"}.get(media.get("media_type"), "🎬 Kontent")
     seasons = media.get("seasons") or {"1": {"episodes": media.get("episodes", {})}}
     total_episodes = sum(len(value.get("episodes", {})) for value in seasons.values())
     base = f"{kind}: <b>{media['name']}</b>\n\n🔢 Kod: <code>{code}</code>\n📺 Fasllar: {len(seasons)}\n🎞 Qismlar: {total_episodes}"
@@ -471,6 +529,7 @@ async def send_media_card(chat_id: int, code: str, media: dict):
 
 
 class Form(StatesGroup):
+    owner_restore_file = State()
     search_code = State()
     search_name = State()
     media_code = State()
@@ -484,6 +543,8 @@ class Form(StatesGroup):
     delete_code = State()
     delete_episode_code = State()
     delete_episode_number = State()
+    delete_season_code = State()
+    delete_season_number = State()
     rename_code = State()
     rename_name = State()
     recode_old = State()
@@ -495,6 +556,7 @@ class Form(StatesGroup):
     start_text = State()
     manage_user_id = State()
     owner_setting_value = State()
+    owner_backup_channel = State()
     broadcast_message = State()
     button_text_value = State()
     edit_poster_code = State()
@@ -587,10 +649,18 @@ async def owner_settings_callback(call: CallbackQuery):
         return await call.answer("Faqat owner uchun", show_alert=True)
     cfg = load_data().get("settings", {})
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"📚 Umumiy baza: {cfg.get('catalog_channel_id') or 'sozlanmagan'}", callback_data="setcfg:catalog_channel_id")],
+        [InlineKeyboardButton(text=f"👥 Referal mukofoti: {cfg.get('referral_reward', 5000)} so‘m", callback_data="setcfg:referral_reward")],
+        [InlineKeyboardButton(text=f"👑 VIP 1 oy narxi: {cfg.get('vip_month_price', 15000)} so‘m", callback_data="setcfg:vip_month_price")],
+        [InlineKeyboardButton(text=f"📅 VIP maksimal muddati: {cfg.get('vip_max_months', 6)} oy", callback_data="setcfg:vip_max_months")],
+        [InlineKeyboardButton(text=f"⏳ VIP oy davomiyligi: {cfg.get('vip_duration_days', 30)} kun", callback_data="setcfg:vip_duration_days")],
+        [InlineKeyboardButton(text=f"🎬 Erta ko‘rish: {cfg.get('early_view_days', 1)} kun", callback_data="setcfg:early_view_days")],
+        [InlineKeyboardButton(text=f"💬 To‘lov admini: @{str(cfg.get('admin_contact', 'obidov_xz')).lstrip('@')}", callback_data="setcfg:admin_contact")],
         [InlineKeyboardButton(text="⬅️ Owner paneli", callback_data="admin_home")]
     ])
-    await call.message.answer("⚙️ <b>Bot sozlamalari</b>\nBarcha kontent barcha foydalanuvchilarga bir vaqtda ochiladi.", reply_markup=kb)
+    try:
+        await call.message.edit_text("⚙️ <b>Bot sozlamalari</b>", reply_markup=kb)
+    except Exception:
+        await call.message.answer("⚙️ <b>Bot sozlamalari</b>", reply_markup=kb)
     await call.answer()
 
 
@@ -600,8 +670,12 @@ async def owner_setting_start(call: CallbackQuery, state: FSMContext):
         return await call.answer("Faqat owner uchun", show_alert=True)
     key = call.data.split(":", 1)[1]
     prompts = {
-        "admin_contact": "To'lov uchun admin username yuboring, masalan @AnimBot_Admin:",
-        "catalog_channel_id": "Qismlar olinadigan kanalning @username yoki -100... ID sini yuboring. Bot shu kanalda administrator bo'lishi shart:",
+        "admin_contact": "To‘lov adminining username sini yuboring, masalan @obidov_xz:",
+        "vip_month_price": "VIP obunasining 1 oylik narxini so‘mda yuboring:",
+        "referral_reward": "Har bir referal uchun beriladigan mukofotni so‘mda yuboring:",
+        "vip_max_months": "VIP uchun ruxsat etilgan maksimal oy sonini yuboring:",
+        "vip_duration_days": "VIP obunasining bir oyi necha kun bo‘lishini yuboring:",
+        "early_view_days": "VIP erta ko‘rish necha kun oldin bo‘lishini yuboring:",
     }
     if key not in prompts:
         return await call.answer("Noma'lum sozlama", show_alert=True)
@@ -635,10 +709,12 @@ async def owner_setting_save(message: Message, state: FSMContext):
         value = raw
         if not value.startswith("@") or len(value) < 2 or " " in value:
             return await message.answer("Username @ bilan boshlansin, masalan @AnimBot_Admin. Qayta yuboring:")
-    elif key == "catalog_channel_id":
-        value = raw
-        if not ((value.startswith("@") and len(value) > 1 and " " not in value) or (value.startswith("-100") and value[1:].isdigit())):
-            return await message.answer("Kanal @username yoki -100... ID ko'rinishida bo'lsin. Qayta yuboring:")
+    elif key in {"vip_max_months", "vip_duration_days", "early_view_days", "vip_month_price", "referral_reward"}:
+        try: value = int(raw)
+        except ValueError: return await message.answer("Faqat raqam yuboring:")
+        if value < 0: return await message.answer("Qiymat manfiy bo‘lishi mumkin emas:")
+        if key in {"vip_max_months", "vip_duration_days"} and value < 1:
+            return await message.answer("Bu qiymat kamida 1 bo‘lishi kerak:")
     else:
         await state.clear()
         return await message.answer("Sozlama topilmadi.")
@@ -646,8 +722,8 @@ async def owner_setting_save(message: Message, state: FSMContext):
     data.setdefault("settings", {})[key] = value
     save_data(data)
     await state.clear()
-    labels = {"catalog_channel_id": "Umumiy baza kanali"}
-    await message.answer(f"✅ {labels[key]} yangilandi: <b>{value}</b>\nO'zgarish darhol kuchga kirdi.", reply_markup=owner_menu())
+    labels = {"admin_contact": "To‘lov admini", "vip_month_price": "VIP oylik narxi", "referral_reward": "Referal mukofoti", "vip_max_months": "VIP maksimal muddati", "vip_duration_days": "VIP oy davomiyligi", "early_view_days": "Erta ko‘rish"}
+    await message.answer(f"✅ {labels.get(key, key)} yangilandi: <b>{value}</b>\nO‘zgarish darhol kuchga kirdi.", reply_markup=owner_menu())
 
 
 @dp.callback_query(F.data == "manage_users")
@@ -656,6 +732,222 @@ async def manage_users_callback(call: CallbackQuery, state: FSMContext):
         return await call.answer("Adminlar uchun", show_alert=True)
     await state.set_state(Form.manage_user_id)
     await call.message.answer("👥 <b>Obunachilarni boshqarish</b>\nBoshqariladigan foydalanuvchi ID sini yuboring:")
+    await call.answer()
+
+
+@dp.callback_query(F.data == "backup_channel_change")
+async def backup_channel_change_callback(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Faqat owner uchun", show_alert=True)
+    current = get_backup_channel_id() or "sozlanmagan"
+    await state.set_state(Form.owner_backup_channel)
+    await call.message.answer(
+        "🗄 <b>Zaxira kanalini sozlash</b>\n"
+        f"Hozirgi kanal ID: <code>{current}</code>\n\n"
+        "Yangi kanal ID sini yuboring (masalan, <code>-1001234567890</code>).\n"
+        "O‘chirish uchun <code>off</code> yuboring. Bot o‘sha kanalga admin bo‘lishi kerak.\n"
+        "Bekor qilish: /cancel"
+    )
+    await call.answer()
+
+
+@dp.message(Form.owner_backup_channel)
+async def backup_channel_change_save(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await state.clear()
+        return await message.answer("⛔ Faqat owner uchun.")
+    raw = (message.text or "").strip()
+    if raw == "/cancel":
+        await state.clear()
+        return await message.answer("Bekor qilindi.", reply_markup=owner_menu())
+    data = load_data()
+    if raw.casefold() in {"off", "o‘chirish", "ochirish"}:
+        data.setdefault("settings", {}).pop("backup_channel_id", None)
+        save_data(data)
+        await state.clear()
+        return await message.answer("✅ Zaxira kanal sozlamasi olib tashlandi. ENV dagi BACKUP_CHANNEL_ID ishlatiladi; u ham bo‘sh bo‘lsa, zaxira shaxsiy xabarga yuboriladi.", reply_markup=owner_menu())
+    try:
+        channel_id = int(raw)
+        if channel_id >= 0:
+            raise ValueError
+    except ValueError:
+        return await message.answer("❌ Kanal ID manfiy raqam bo‘lishi kerak, masalan -1001234567890. Qayta yuboring:")
+    data.setdefault("settings", {})["backup_channel_id"] = str(channel_id)
+    save_data(data)
+    await state.clear()
+    await message.answer(f"✅ Zaxira kanali saqlandi: <code>{channel_id}</code>\nBot kanalga admin qilinganini tekshiring.", reply_markup=owner_menu())
+
+
+@dp.callback_query(F.data == "owner_backup")
+async def owner_backup_callback(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Faqat owner uchun", show_alert=True)
+    data = load_data()
+    payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    doc = BufferedInputFile(payload, filename=f"bot_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+    try:
+        backup_channel_id = get_backup_channel_id()
+        if backup_channel_id:
+            await bot.send_document(backup_channel_id, doc, caption="🤖 Bot avtomatik zaxirasi")
+            await call.message.answer("✅ Zaxira JSON fayli BACKUP_CHANNEL_ID kanaliga yuborildi.", reply_markup=owner_menu())
+        else:
+            await bot.send_document(call.from_user.id, doc, caption="💾 Bot zaxirasi. Xavfsiz joyda saqlang.")
+            await call.message.answer("✅ Zaxira sizga shaxsiy xabarda yuborildi. Renderda BACKUP_CHANNEL_ID kiritsangiz, kanalga ham yuboriladi.", reply_markup=owner_menu())
+    except Exception as exc:
+        await call.message.answer(f"❌ Zaxira yuborilmadi. Kanal IDsi va bot adminligini tekshiring. ({type(exc).__name__})")
+    await call.answer()
+
+@dp.callback_query(F.data == "owner_restore_help")
+async def owner_restore_help(call: CallbackQuery, state: FSMContext):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Faqat owner uchun", show_alert=True)
+    await state.set_state(Form.owner_restore_file)
+    await state.update_data(restore_files=0)
+    await call.message.answer(
+        "♻️ <b>Zaxirani tiklash</b>\n"
+        "Bitta JSON fayl yoki ichida bir nechta .json bo'lgan ZIP arxiv yuboring. "
+        "Bir nechta JSONni alohida yubormoqchi bo'lsangiz, ketma-ket yuboring va oxirida /done yozing.\n"
+        "Yuborilgan JSONlar birlashtiriladi: medias kodlari qo'shiladi/yangilanadi, qolgan sozlamalar oxirgi fayldan olinadi.\n"
+        "Bekor qilish: /cancel"
+    )
+    await call.answer()
+
+
+def _merge_backup_objects(base, incoming):
+    if not isinstance(incoming, dict):
+        raise ValueError("JSON ildizi obyekt bo'lishi kerak")
+    if not isinstance(incoming.get("medias", {}), dict):
+        raise ValueError("medias bo'limi noto'g'ri")
+    # Har bir zaxiradagi media kodlarini saqlab qolamiz; bir xil kod bo'lsa yangi qiymat ustun.
+    base.setdefault("medias", {}).update(incoming.get("medias", {}))
+    for key, value in incoming.items():
+        if key == "medias":
+            continue
+        if key == "users" and isinstance(value, dict):
+            base.setdefault("users", {}).update(value)
+        elif key == "settings" and isinstance(value, dict):
+            base.setdefault("settings", {}).update(value)
+        elif key in ("admins", "channels", "banned_users") and isinstance(value, list):
+            current = base.setdefault(key, [])
+            base[key] = list(dict.fromkeys(current + value))
+        else:
+            base[key] = value
+    return base
+
+
+@dp.message(Form.owner_restore_file)
+async def owner_restore_file(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+    if message.text and message.text.strip().lower() in ("/done", "done", "tayyor"):
+        saved = await state.get_data()
+        files_count = int(saved.get("restore_files", 0))
+        if not files_count:
+            return await message.answer("❌ Hali JSON yuborilmadi. JSON yoki ZIP yuboring:")
+        restored = saved.get("restore_data")
+        if not isinstance(restored, dict):
+            return await message.answer("❌ Tiklash ma'lumotlari topilmadi. Qaytadan boshlang: /cancel")
+        base = default_data()
+        for key, value in base.items():
+            restored.setdefault(key, value)
+        restored.setdefault("settings", {})
+        for key, value in base["settings"].items():
+            restored["settings"].setdefault(key, value)
+        save_data(restored)
+        await state.clear()
+        return await message.answer(f"✅ Tiklandi. {files_count} ta JSON fayl birlashtirildi; jami {len(restored.get('medias', {}))} ta kontent kodi mavjud.", reply_markup=owner_menu())
+    if not message.document:
+        return await message.answer("JSON yoki ichida JSON fayllari bo'lgan ZIP arxiv yuboring. Bir nechta fayl uchun oxirida /done yozing.")
+    fname = (message.document.file_name or "").lower()
+    if not (fname.endswith(".json") or fname.endswith(".zip")):
+        return await message.answer("❌ Faqat .json yoki .zip fayl qabul qilinadi.")
+    try:
+        file = await bot.get_file(message.document.file_id)
+        stream = await bot.download_file(file.file_path)
+        raw = stream.read() if hasattr(stream, "read") else bytes(stream)
+        json_blobs = []
+        if fname.endswith(".json"):
+            json_blobs = [raw]
+        else:
+            with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                json_blobs = [archive.read(n) for n in archive.namelist() if n.lower().endswith(".json") and not n.endswith("/")]
+            if not json_blobs:
+                return await message.answer("❌ ZIP ichidan .json fayl topilmadi.")
+        saved = await state.get_data()
+        base = saved.get("restore_data") or default_data()
+        for blob in json_blobs:
+            incoming = json.loads(blob.decode("utf-8-sig"))
+            base = _merge_backup_objects(base, incoming)
+        count = int(saved.get("restore_files", 0)) + len(json_blobs)
+        await state.update_data(restore_data=base, restore_files=count)
+        await message.answer(f"✅ {len(json_blobs)} ta JSON o'qildi. Jami: {count} ta. Yana fayl yuboring yoki tiklashni yakunlash uchun /done yozing.")
+    except Exception as exc:
+        logging.exception("Backup restore failed")
+        await message.answer(f"❌ Zaxirani o'qib bo'lmadi: {type(exc).__name__}: {str(exc)[:180]}. JSON fayl bot yaratgan zaxira ekanini tekshiring.")
+
+@dp.callback_query(F.data == "owner_maintenance")
+async def owner_maintenance_callback(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Faqat owner uchun", show_alert=True)
+    data = load_data(); cfg = data.setdefault("settings", {})
+    cfg["maintenance"] = not bool(cfg.get("maintenance", False)); save_data(data)
+    status = "YOQILDI" if cfg["maintenance"] else "O'CHIRILDI"
+    await call.message.answer(f"🛠 Texnik tanaffus {status}.", reply_markup=owner_menu())
+    await call.answer()
+
+@dp.callback_query(F.data == "owner_vip")
+async def owner_vip_callback(call: CallbackQuery):
+    if not is_owner(call.from_user.id):
+        return await call.answer("Faqat owner uchun", show_alert=True)
+    data = load_data(); cfg = data.setdefault("settings", {})
+    cfg["vip_enabled"] = not bool(cfg.get("vip_enabled", False)); save_data(data)
+    status = "YOQILDI" if cfg["vip_enabled"] else "O'CHIRILDI"
+    detail = "Foydalanuvchilarga VIP olish va VIP nima tugmalari ko'rsatiladi." if cfg["vip_enabled"] else "Foydalanuvchilardan VIP tugmalari yashiriladi."
+    await call.message.answer(f"💎 VIP rejimi {status}. {detail}", reply_markup=owner_menu())
+    await call.answer()
+
+@dp.callback_query(F.data == "vip_info")
+async def vip_info_callback(call: CallbackQuery):
+    cfg = load_data().get("settings", {})
+    if not cfg.get("vip_enabled", False) and not is_owner(call.from_user.id):
+        return await call.answer("VIP hozircha o‘chirilgan.", show_alert=True)
+    price = int(cfg.get("vip_month_price", 15000) or 15000)
+    text = (
+        "👑 <b>VIP — tomoshadan ko‘proq zavq oling!</b>\n\n"
+        "VIP obunasi orqali sevimli anime, serial va filmlaringizni yanada qulayroq tomosha qiling! 💎\n\n"
+        "✨ <b>VIP imkoniyatlari:</b>\n\n"
+        "🚀 3 kun oldin tomosha qilish\n"
+        "🎬 720p–1080p sifatdagi videolar (manbada mavjud bo‘lsa)\n"
+        "🔓 Majburiy kanallarga obunasiz kirish\n"
+        "📤 Kontentni ulashish imkoniyati\n"
+        "♥️ Sevimlilar va ▶️ Davom ettirish\n\n"
+        f"💎 VIP narxi: oyiga {price:,} so‘m".replace(",", " ")
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💎 VIP olish", callback_data="vip_buy")],
+        [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")],
+    ])
+    try: await call.message.edit_text(text, reply_markup=kb)
+    except Exception: await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "vip_buy")
+async def vip_buy_callback(call: CallbackQuery):
+    cfg = load_data().get("settings", {})
+    if not cfg.get("vip_enabled", False) and not is_owner(call.from_user.id):
+        return await call.answer("VIP hozircha o'chirilgan.", show_alert=True)
+    contact = str(cfg.get("admin_contact", "obidov_xz")).lstrip("@")
+    text = "💎 <b>VIP olish</b>\n\nVIP obunasini faollashtirish uchun admin bilan bog'laning."
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✉️ Admin bilan bog'lanish", url=f"https://t.me/{contact}")],
+        [InlineKeyboardButton(text="❓ VIP o'zi nima?", callback_data="vip_info")],
+        [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")],
+    ])
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
     await call.answer()
 
 
@@ -735,10 +1027,25 @@ async def user_ban_callback(call: CallbackQuery):
 
 
 
+@dp.message(Command("backup"))
+async def backup_command(message: Message):
+    if not is_owner(message.from_user.id):
+        return await message.answer("⛔ Bu buyruq faqat owner uchun.")
+    payload = json.dumps(load_data(), ensure_ascii=False, indent=2).encode("utf-8")
+    doc = BufferedInputFile(payload, filename=f"bot_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+    backup_channel_id = get_backup_channel_id()
+    if backup_channel_id:
+        await bot.send_document(backup_channel_id, doc, caption="🤖 Bot zaxirasi")
+        await message.answer("✅ Zaxira kanalga yuborildi.")
+    else:
+        await message.answer_document(doc, caption="💾 Bot zaxirasi")
+
 @dp.message(Command("admin"))
 async def admin_command(message: Message):
     if not is_admin(message.from_user.id):
         return await message.answer("⛔ Sizda admin huquqi yo'q.")
+    try: await message.delete()
+    except Exception: pass
     await message.answer("🎬 <b>Kino va serial boshqaruvi</b>", reply_markup=admin_menu(message.from_user.id))
 
 
@@ -746,6 +1053,8 @@ async def admin_command(message: Message):
 async def owner_command(message: Message):
     if not is_owner(message.from_user.id):
         return await message.answer("⛔ Bu buyruq faqat bot egasi uchun.")
+    try: await message.delete()
+    except Exception: pass
     await message.answer("⚙️ <b>Owner paneli</b>", reply_markup=owner_menu())
 
 
@@ -763,15 +1072,15 @@ async def home(call: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "search_menu")
 async def search_menu_open(call: CallbackQuery):
     try:
-        await call.message.edit_text("🔎 <b>Kino va video izlash</b>\n\nKod yoki nom orqali qidiring, ro‘yxatlardan foydalaning:", reply_markup=search_menu(call.from_user.id))
+        await call.message.edit_text("🔎 <b>Kino va video izlash</b>", reply_markup=search_menu(call.from_user.id))
     except Exception:
-        await call.message.answer("🔎 <b>Kino va video izlash</b>\n\nKod yoki nom orqali qidiring, ro‘yxatlardan foydalaning:", reply_markup=search_menu(call.from_user.id))
+        await call.message.answer("🔎 <b>Kino va video izlash</b>", reply_markup=search_menu(call.from_user.id))
     await call.answer()
 
 
 @dp.callback_query(F.data == "guide")
 async def guide(call: CallbackQuery):
-    text = "📖 <b>Qo'llanma</b>\n\n1️⃣ Kerakli bo'limni tanlang: kino, serial yoki drama.\n2️⃣ Kod yoki nom orqali qidiring; nom yozib yuborilgach o'xshash natijalar tugma bo'lib chiqadi.\n3️⃣ Kontentni oching — mavjud bo'lsa 1-qismdan boshlang, pastdagi ⬅️/➡️ tugmalari bilan qismlar almashadi.\n\n🛑 Orqaga tugmasi oldingi menyuga qaytaradi."
+    text = "📖 <b>Qo'llanma</b>"
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛑 Orqaga", callback_data="home")]])
     try:
         await call.message.edit_text(text, reply_markup=kb)
@@ -923,14 +1232,14 @@ async def catalog_send_part(call: CallbackQuery):
 async def search_name_start(call: CallbackQuery, state: FSMContext):
     await state.update_data(search_filter="all")
     await state.set_state(Form.search_name)
-    await call.message.answer("🔤 Qidirilayotgan kino, serial yoki drama nomini yozing. Har safar yuborganingizda mos nomlar tanlash uchun chiqadi:")
+    await call.message.answer("🔤 Qidirilayotgan kino yoki serial nomini yozing. Har safar yuborganingizda mos nomlar tanlash uchun chiqadi:")
     await call.answer()
 
 
 @dp.callback_query(F.data.startswith("category:"))
 async def category_search_start(call: CallbackQuery, state: FSMContext):
     media_type = call.data.split(":", 1)[1]
-    labels = {"movie":"kino", "series":"serial", "drama":"drama"}
+    labels = {"movie":"kino", "series":"serial", "drama":"drama", "anime":"anime", "cartoon":"multfilm"}
     await state.update_data(search_filter=media_type)
     await state.set_state(Form.search_name)
     await call.message.answer(f"🔎 {labels.get(media_type, 'kontent').capitalize()} bo'limi. Nomini yozing — mos kelgan nomlar tanlash uchun chiqadi:")
@@ -948,7 +1257,7 @@ async def search_name_result(message: Message, state: FSMContext):
     media_filter = saved.get("search_filter", "all")
     data = load_data()
     matches = [(str(code), item) for code, item in data.get("medias", {}).items()
-               if item.get("media_type", "series") in {"movie", "series", "drama"}
+               if item.get("media_type", "series") in {"movie", "series", "drama", "anime", "cartoon"}
                and query in item.get("name", "").casefold()
                and (media_filter == "all" or item.get("media_type", "series") == media_filter)
                and media_available_for_user(message.from_user.id, item, data)]
@@ -958,7 +1267,7 @@ async def search_name_result(message: Message, state: FSMContext):
         return await message.answer("❌ Mos nom topilmadi. Boshqa nom yoki qismini yozib ko'ring:", reply_markup=search_menu(message.from_user.id))
     rows = []
     for code, item in matches[:40]:
-        icon = {"movie":"🎞", "series":"📺", "drama":"🎭"}.get(item.get("media_type"), "🎬")
+        icon = {"movie":"🎞", "series":"📺", "drama":"🎭", "anime":"🍥", "cartoon":"🎨"}.get(item.get("media_type"), "🎬")
         rows.append([InlineKeyboardButton(text=f"{icon} {item.get('name','Nomsiz')} · {code}", callback_data=f"show:{code}")])
     rows.append([InlineKeyboardButton(text="🔎 Yana qidirish", callback_data="search_name")])
     rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="search_menu")])
@@ -985,6 +1294,24 @@ async def search_code(message: Message, state: FSMContext):
         return await message.answer("❌ Bu kod bo‘yicha kino yoki serial topilmadi.")
     await send_media_card(message.chat.id, code, media)
 
+
+@dp.callback_query(F.data == "page_info")
+async def page_info(call: CallbackQuery):
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("season_page:"))
+async def season_page(call: CallbackQuery):
+    try:
+        _, code, season_no, page = call.data.split(":")
+        data = load_data(); media = data["medias"][code]
+        seasons = media.get("seasons") or {"1": {"episodes": media.get("episodes", {})}}
+        episodes = seasons.get(season_no, {}).get("episodes", {})
+        markup = episode_keyboard(code, episodes, user_id=call.from_user.id, season=season_no, media=media, page=int(page))
+        await call.message.edit_reply_markup(reply_markup=markup)
+    except Exception:
+        await call.answer("Sahifani ochib bo‘lmadi.", show_alert=True)
+    else:
+        await call.answer()
 
 @dp.callback_query(F.data.startswith("season_show:"))
 async def season_show(call: CallbackQuery):
@@ -1087,7 +1414,7 @@ async def send_episode(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("category_list:"))
 async def category_list_callback(call: CallbackQuery):
     media_type = call.data.split(":", 1)[1]
-    labels = {"movie":("🎞 Kinolar", "📭 Kino hali qo'shilmagan"), "series":("📺 Seriallar", "📭 Serial hali qo'shilmagan"), "drama":("🎭 Dramalar", "📭 Drama hali qo'shilmagan")}
+    labels = {"movie":("🎞 Kinolar", "📭 Kino hali qo'shilmagan"), "series":("📺 Seriallar", "📭 Serial hali qo'shilmagan"), "drama":("🎭 Dramalar", "📭 Drama hali qo'shilmagan"), "anime":("🍥 Anime", "📭 Anime hali qo'shilmagan"), "cartoon":("🎨 Multfilmlar", "📭 Multfilm hali qo'shilmagan")}
     title, empty = labels.get(media_type, ("🎬 Kontent", "📭 Hozircha bo'sh"))
     await media_category_list(call, media_type, title, empty)
 
@@ -1230,13 +1557,27 @@ async def ask(call: CallbackQuery, state: FSMContext, new_state: State, prompt: 
     await call.answer()
 
 
+@dp.callback_query(F.data == "admin_add_content")
+async def admin_add_content_callback(call: CallbackQuery, state: FSMContext):
+    if not has_permission(call.from_user.id, "add_content"):
+        return await call.answer("⛔ Sizda kontent qo'shish huquqi yo'q.", show_alert=True)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎞 Kino", callback_data="newtype:movie"), InlineKeyboardButton(text="🍥 Anime", callback_data="newtype:anime")],
+        [InlineKeyboardButton(text="🎨 Multfilm", callback_data="newtype:cartoon")],
+    ])
+    await call.message.answer("Qaysi turdagi kontent qo'shamiz?", reply_markup=kb)
+    await call.answer()
+
+
 @dp.callback_query(F.data == "add_movie")
 async def add_movie(call: CallbackQuery, state: FSMContext):
     if not has_permission(call.from_user.id, "add_content"):
         return await call.answer("⛔ Sizda kontent qo'shish huquqi yo'q.", show_alert=True)
-    await state.update_data(media_type="movie")
-    await state.set_state(Form.media_code)
-    await call.message.answer("🔢 Yangi kino uchun takrorlanmaydigan kod yuboring:")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎞 Kino", callback_data="newtype:movie"), InlineKeyboardButton(text="🍥 Anime", callback_data="newtype:anime")],
+        [InlineKeyboardButton(text="🎨 Multfilm", callback_data="newtype:cartoon")],
+    ])
+    await call.message.answer("Qaysi turdagi kontent qo'shamiz?", reply_markup=kb)
     await call.answer()
 
 
@@ -1245,7 +1586,8 @@ async def add_series(call: CallbackQuery, state: FSMContext):
     if not has_permission(call.from_user.id, "add_content"):
         return await call.answer("⛔ Sizda kontent qo'shish huquqi yo'q.", show_alert=True)
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📺 Serial", callback_data="newtype:series"), InlineKeyboardButton(text="🎭 Drama", callback_data="newtype:drama")],
+        [InlineKeyboardButton(text="📺 Serial", callback_data="newtype:series")],
+        [InlineKeyboardButton(text="🍥 Anime", callback_data="newtype:anime"), InlineKeyboardButton(text="🎨 Multfilm", callback_data="newtype:cartoon")],
     ])
     await call.message.answer("Qaysi turdagi kontent qo'shamiz?", reply_markup=kb)
     await call.answer()
@@ -1274,7 +1616,7 @@ async def media_code(message: Message, state: FSMContext):
     await state.update_data(new_code=code)
     await state.set_state(Form.media_name)
     saved = await state.get_data()
-    await message.answer({"movie":"🎞 Kino nomini", "series":"📺 Serial nomini", "drama":"🎭 Drama nomini"}.get(saved.get("media_type"), "🎬 Kontent nomini") + " yuboring:")
+    await message.answer({"movie":"🎞 Kino nomini", "series":"📺 Serial nomini", "drama":"🎭 Drama nomini", "anime":"🍥 Anime nomini", "cartoon":"🎨 Multfilm nomini"}.get(saved.get("media_type"), "🎬 Kontent nomini") + " yuboring:")
 
 
 @dp.message(Form.media_name)
@@ -1302,7 +1644,27 @@ async def media_info(message: Message, state: FSMContext):
         return await message.answer("⛔ Bu amal faqat adminlar uchun.")
     poster = None
     description = ""
-    if message.text and message.text.strip() == "/skip":
+    forwarded_record = None
+    origin = getattr(message, "forward_origin", None)
+    if origin and getattr(origin, "type", "") == "channel":
+        source_chat = getattr(origin, "chat", None)
+        source_message_id = getattr(origin, "message_id", None)
+        if not source_chat or not source_message_id:
+            return await message.answer("❌ Forward manbasini aniqlab bo'lmadi. Kanal postini to'g'ridan-to'g'ri forward qiling.")
+        try:
+            me = await bot.get_me()
+            member = await bot.get_chat_member(source_chat.id, me.id)
+            status = str(member.status).split(".")[-1].lower()
+            if status not in ("administrator", "creator"):
+                return await message.answer("❌ Bot bu manba kanal/guruhda admin emas. Botni har bir kontent kanaliga administrator qiling.")
+        except Exception as exc:
+            logging.warning("Forward source permission check failed: %s", exc)
+            return await message.answer("❌ Manba kanalni tekshirib bo'lmadi. Bot shu kanal/guruhda administrator ekanini tekshiring.")
+        forwarded_record = {"chat_id": source_chat.id, "message_id": source_message_id}
+        description = (message.caption or "").strip()
+        if message.photo:
+            poster = message.photo[-1].file_id
+    elif message.text and message.text.strip() == "/skip":
         pass
     elif message.photo:
         poster = message.photo[-1].file_id
@@ -1311,7 +1673,7 @@ async def media_info(message: Message, state: FSMContext):
         description = message.text.strip()
     else:
         return await message.answer("Rasm yoki matn yuboring, yoki /skip bosing.")
-    await state.update_data(pending_poster=poster, pending_description=description)
+    await state.update_data(pending_poster=poster, pending_description=description, pending_forward_record=forwarded_record)
     await state.set_state(Form.media_details)
     await message.answer(
         "📝 Qo‘shimcha ma’lumotlarni quyidagi ko‘rinishda yuboring:\n"
@@ -1339,9 +1701,11 @@ async def media_details_save(message: Message, state: FSMContext):
     code, name = str(saved["new_code"]), str(saved["new_name"])
     data = load_data()
     media_type = saved.get("media_type", "series")
+    first_episode = saved.get("pending_forward_record")
+    seasons = {"1": {"episodes": ({"1": first_episode} if first_episode else {})}}
     data["medias"][code] = {
         "name": name, "description": saved.get("pending_description", ""),
-        "poster_file_id": saved.get("pending_poster"), "episodes": {}, "seasons": {},
+        "poster_file_id": saved.get("pending_poster"), "episodes": ({"1": first_episode} if first_episode else {}), "seasons": seasons,
         "created_at": now_ts(), "media_type": media_type, **fields
     }
     save_data(data)
@@ -1359,6 +1723,8 @@ async def notify_content_added(code: str, item: dict):
             f"🔢 Kodi: <code>{code}</code>\n\n"
             "Tomosha qilish uchun quyidagi tugmani bosing!")
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎬 Tomosha qilish", callback_data=f"show:{code}")]])
+    if not data.get("settings", {}).get("notify_new_content", True):
+        return
     for uid in list(data.get("users", {})):
         try:
             await bot.send_message(int(uid), text, reply_markup=kb)
@@ -1384,15 +1750,18 @@ async def media_season_count_save(message: Message, state: FSMContext):
     if not item:
         await state.clear()
         return await message.answer("Kontent topilmadi. Qaytadan qo‘shing.", reply_markup=admin_menu(message.from_user.id))
+    existing_eps = item.get("seasons", {}).get("1", {}).get("episodes", {})
     item["seasons"] = {str(n): {"episodes": {}} for n in range(1, count + 1)}
+    if existing_eps:
+        item["seasons"].setdefault("1", {"episodes": {}})["episodes"].update(existing_eps)
     save_data(data)
     await state.clear()
     await notify_content_added(code, item)
     await message.answer(
         f"✅ <b>{item['name']}</b> (kod <code>{code}</code>) botga qo‘shildi.\n\n"
         f"📺 Fasllar: {count} ta\n\n"
-        "Endi Admin panel → <b>Qism qo‘shish</b> ni bosing, kodini kiriting va videolarni botga ketma-ket yuboring.\n"
-        "Qismlar avtomatik raqamlanadi. Kanal, hashtag yoki forward kerak emas.",
+        "Endi serial/anime qismlarini <b>Qism yoki yangi sezon</b> bo'limidan qo'shing.\n"
+        "Kino qo'shayotganda esa bot admin bo'lgan kanal/guruh postini forward qilsangiz, u 1-qism sifatida saqlanadi.",
         reply_markup=admin_menu()
     )
 
@@ -1417,8 +1786,7 @@ async def episode_code(message: Message, state: FSMContext):
     await state.set_state(Form.episode_season)
     await message.answer(
         f"🎬 <b>{item['name']}</b> tanlandi.\nMavjud fasllar: {', '.join(sorted(seasons, key=lambda x: int(x) if str(x).isdigit() else 999))}\n\n"
-        "Qaysi faslga qism qo‘shamiz? Fasl raqamini yuboring (masalan: 2).\n"
-        "Agar bu yangi fasl bo‘lsa ham raqamini yozing."
+        "Fasl raqamini yuboring (masalan: 2). Yangi fasl bo‘lsa ham raqamini yozing."
     )
 
 
@@ -1443,9 +1811,7 @@ async def episode_season_select(message: Message, state: FSMContext):
     await state.update_data(batch_season=season_no, batch_count=0)
     await state.set_state(Form.episode_batch)
     prompt = await message.answer(
-        f"🎬 <b>{item['name']}</b> · <b>{season_no}-fasl</b>\nQismlar olinadigan kanaldagi postlarni botga forward qiling.\n"
-        "Bot faqat bot administrator bo'lgan kanaldan forward qilingan postlarni qabul qiladi va 1-qism, 2-qism deb raqamlaydi.\n"
-        "Tugatish: /done · Bekor qilish: /cancel"
+        f"🎬 <b>{item['name']}</b> · <b>{season_no}-fasl</b>\nQismlarni bittadan yuboring. Birinchi media 1-qism, ikkinchisi 2-qism bo‘ladi.\n/done — tugatish · /cancel — bekor qilish"
     )
     await state.update_data(progress_message_id=prompt.message_id)
 
@@ -1466,21 +1832,21 @@ async def episode_batch_message(message: Message, state: FSMContext):
         await state.clear()
         return await message.answer("❎ Bekor qilindi.", reply_markup=admin_menu(message.from_user.id))
 
+    # Media istalgan manbadan qabul qilinadi: kanal, mavzu, guruh yoki shaxsiy chat.
+    # Faylni serverga yuklamaymiz; Telegram file_id yoki kerak bo'lsa source message saqlanadi.
+    media_type = None
+    file_id = None
+    for attr in ("video", "document", "audio", "animation", "photo", "voice"):
+        obj = getattr(message, attr, None)
+        if obj:
+            media_type = attr
+            file_id = (obj[-1].file_id if attr == "photo" else obj.file_id)
+            break
     origin = getattr(message, "forward_origin", None)
-    if not origin or getattr(origin, "type", "") != "channel":
-        return await message.answer("❌ Qismni bot administrator bo'lgan Telegram kanalingizdan forward qiling. Oddiy video yoki boshqa chatdan forward qabul qilinmaydi.\nTugatish: /done · Bekor qilish: /cancel")
-    origin_chat = getattr(origin, "chat", None)
-    origin_message_id = getattr(origin, "message_id", None)
-    if not origin_chat or not origin_message_id:
-        return await message.answer("❌ Forward qilingan kanal xabarini aniqlab bo'lmadi. Kanal postini to'g'ridan-to'g'ri forward qiling.")
-    try:
-        me = await bot.get_me()
-        member = await bot.get_chat_member(origin_chat.id, me.id)
-        status = str(member.status).split(".")[-1].lower()
-        if status not in ("administrator", "creator"):
-            return await message.answer("❌ Bot bu kanalda administrator emas. Avval botni kanalga admin qiling.")
-    except Exception:
-        return await message.answer("❌ Kanalni tekshirib bo'lmadi. Bot shu kanalda administrator ekanini tekshiring.")
+    origin_chat = getattr(origin, "chat", None) if origin else None
+    origin_message_id = getattr(origin, "message_id", None) if origin else None
+    if not file_id and not (origin_chat and origin_message_id):
+        return await message.answer("❌ Video yoki media yuboring/forward qiling. Tugatish: /done")
 
     saved = await state.get_data()
     code = str(saved.get("batch_code", ""))
@@ -1494,7 +1860,10 @@ async def episode_batch_message(message: Message, state: FSMContext):
     episodes = season.setdefault("episodes", {})
     numeric = [int(n) for n in episodes if str(n).isdigit()]
     number = max(numeric, default=0) + 1
-    record = {"chat_id": origin_chat.id, "message_id": origin_message_id}
+    if file_id:
+        record = {"file_id": file_id, "media_type": media_type or "video", "caption": (message.caption or "")[:900]}
+    else:
+        record = {"chat_id": origin_chat.id, "message_id": origin_message_id}
     episodes[str(number)] = record
     if season_no == "1":
         item.setdefault("episodes", {})[str(number)] = record
@@ -1597,7 +1966,7 @@ async def admin_permission_toggle(call: CallbackQuery):
 async def del_media(call: CallbackQuery, state: FSMContext):
     if not has_permission(call.from_user.id, "delete_content"):
         return await call.answer("⛔ Sizda o'chirish huquqi yo'q.", show_alert=True)
-    await ask(call, state, Form.delete_code, "O'chiriladigan kino/serial/drama kodini yuboring:")
+    await ask(call, state, Form.delete_code, "O'chiriladigan kino yoki serial kodini yuboring:")
 
 
 @dp.message(Form.delete_code)
@@ -1651,6 +2020,39 @@ async def delete_episode_save(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(f"🗑 {number}-qism o'chirildi.", reply_markup=admin_menu(message.from_user.id))
 
+
+@dp.callback_query(F.data == "del_season")
+async def del_season_start(call: CallbackQuery, state: FSMContext):
+    if not has_permission(call.from_user.id, "delete_content"):
+        return await call.answer("⛔ Sizda o‘chirish huquqi yo‘q.", show_alert=True)
+    await ask(call, state, Form.delete_season_code, "Faslini o‘chirmoqchi bo‘lgan kino/serial kodini yuboring:")
+
+@dp.message(Form.delete_season_code)
+async def del_season_code(message: Message, state: FSMContext):
+    if not has_permission(message.from_user.id, "delete_content"):
+        await state.clear(); return
+    code = (message.text or "").strip(); data = load_data()
+    if code not in data.get("medias", {}):
+        return await message.answer("Kod topilmadi. Qayta yuboring:")
+    await state.update_data(delete_season_code=code)
+    await state.set_state(Form.delete_season_number)
+    await message.answer("O‘chiriladigan fasl raqamini yuboring:")
+
+@dp.message(Form.delete_season_number)
+async def del_season_number(message: Message, state: FSMContext):
+    if not has_permission(message.from_user.id, "delete_content"):
+        await state.clear(); return
+    raw = (message.text or "").strip()
+    if not raw.isdigit(): return await message.answer("Fasl raqamini raqam bilan yuboring:")
+    saved = await state.get_data(); code = str(saved.get("delete_season_code", "")); sn = str(int(raw))
+    data = load_data(); media = data.get("medias", {}).get(code)
+    if not media or sn not in media.get("seasons", {}):
+        return await message.answer("Bunday fasl topilmadi. Qayta yuboring:")
+    count = len(media["seasons"][sn].get("episodes", {}))
+    del media["seasons"][sn]
+    if sn == "1": media["episodes"] = {}
+    save_data(data); await state.clear()
+    await message.answer(f"🗑 {sn}-fasl va undagi {count} ta qism o‘chirildi.", reply_markup=admin_menu(message.from_user.id))
 
 @dp.callback_query(F.data == "rename_media")
 async def rename_start(call: CallbackQuery, state: FSMContext):
@@ -1855,21 +2257,58 @@ async def start_text_save(message: Message, state: FSMContext):
     await message.answer("✅ /start xabari o'zgartirildi.", reply_markup=admin_menu(message.from_user.id))
 
 
+@dp.callback_query(F.data == "account")
+async def account_callback(call: CallbackQuery):
+    data = load_data()
+    user = data.setdefault("users", {}).get(str(call.from_user.id), {})
+    balance = int(user.get("balance", 0) or 0)
+    vip_until = int(user.get("vip_until", 0) or 0)
+    vip_status = "✅ Ha" if vip_until > now_ts() else "❌ Yo‘q"
+    vip_date = fmt_date(vip_until) if vip_until > now_ts() else "—"
+    text = (f"👤 <b>Hisobim</b>\n\n🆔 ID: <code>{call.from_user.id}</code>\n"
+            f"💰 Balans: <b>{balance:,} so‘m</b>\n👑 VIP obunachi: <b>{vip_status}</b>\n📅 VIP muddati: <b>{vip_date}</b>".replace(",", " "))
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💎 VIP olish", callback_data="vip_buy")], [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="home")]])
+    try: await call.message.edit_text(text, reply_markup=kb)
+    except Exception: await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "owner_notify_toggle")
+async def owner_notify_toggle(call: CallbackQuery):
+    if not is_owner(call.from_user.id): return await call.answer("Faqat owner uchun", show_alert=True)
+    data = load_data(); cfg = data.setdefault("settings", {})
+    cfg["notify_new_content"] = not bool(cfg.get("notify_new_content", True)); save_data(data)
+    await call.message.answer("📣 Yangi kontent xabarlari " + ("yoqildi." if cfg["notify_new_content"] else "o‘chirildi."), reply_markup=owner_menu())
+    await call.answer()
+
+
 @dp.callback_query(F.data == "stats")
 async def stats(call: CallbackQuery):
     if not is_admin(call.from_user.id):
         return await call.answer("Faqat adminlar uchun", show_alert=True)
     data = load_data()
     users = list(data.get("users", {}).values())
-    cutoff = now_ts() - 30 * 24 * 60 * 60
-    active = sum(1 for u in users if int(u.get("last_seen", u.get("joined_at", 0)) or 0) >= cutoff)
-    inactive = max(0, len(users) - active)
-    total_episodes = sum(sum(len(season.get("episodes", {})) for season in (a.get("seasons") or {}).values()) if a.get("seasons") else len(a.get("episodes", {})) for a in data["medias"].values())
+    now = now_ts()
+    def seen_in(days):
+        return sum(1 for u in users if int(u.get("last_seen", u.get("joined_at", 0)) or 0) >= now - days * 86400)
+    def joined_in(days):
+        return sum(1 for u in users if int(u.get("joined_at", 0) or 0) >= now - days * 86400)
+    active30 = seen_in(30)
+    inactive = max(0, len(users) - active30)
+    medias = list(data.get("medias", {}).values())
+    movie_count = sum(1 for m in medias if m.get("media_type") == "movie")
+    anime_count = sum(1 for m in medias if m.get("media_type") == "anime")
+    cartoon_count = sum(1 for m in medias if m.get("media_type") == "cartoon")
+    series_count = sum(1 for m in medias if m.get("media_type") in {"series", "drama"})
+    downloads = data.get("downloads", {})
+    def downloads_in(days):
+        return sum(1 for t in downloads.values() if isinstance(t, (int, float)) and t >= now - days * 86400) if isinstance(downloads, dict) else 0
     await call.message.answer(
-        f"📊 <b>Statistika</b>\n👥 Jami foydalanuvchilar: {len(users)}\n"
-        f"🟢 Faol (oxirgi 30 kun): {active}\n⚫ Faol emas (30 kundan beri): {inactive}\n"
-        f"🎬 Kino/serial: {len(data['medias'])}\n🎞 Qismlar: {total_episodes}\n"
-        f"👑 Adminlar: {len(data['admins'])}\n📢 Kanallar: {len(data['channels'])}"
+        f"📊 <b>Statistika</b>\n• Obunachilar soni: {len(users)} ta\n• Faol obunachilar: {active30} ta\n• Tark etganlar: {inactive} ta\n\n"
+        f"📈 <b>Obunachilar qo‘shilishi</b>\n• Oxirgi 24 soat: +{joined_in(1)} obunachi\n• Oxirgi 7 kun: +{joined_in(7)} obunachi\n• Oxirgi 30 kun: +{joined_in(30)} obunachi\n\n"
+        f"📊 <b>Faollik</b>\n• Oxirgi 24 soatda faol: {seen_in(1)} ta\n• Oxirgi 7 kun faol: {seen_in(7)} ta\n• Oxirgi 30 kun faol: {active30} ta\n\n"
+        f"📥 <b>Yuklanishlar</b>\n• Oxirgi 24 soat: {downloads_in(1)} ta\n• Oxirgi 7 kun: {downloads_in(7)} ta\n• Oxirgi 30 kun: {downloads_in(30)} ta\n\n"
+        f"🎬 Kinolar soni: {movie_count} ta\n🍥 Anime: {anime_count} ta\n🎨 Multfilm: {cartoon_count} ta\n📺 Serial/drama: {series_count} ta"
     )
     await call.answer()
 
@@ -2185,6 +2624,13 @@ async def main():
     save_data(data)
     runner = await start_web_server()
     try:
+        from aiogram.types import BotCommandScopeChat
+        await bot.set_my_commands([BotCommand(command="start", description="Botni boshlash")])
+        owner_commands = [BotCommand(command="start", description="Botni boshlash"), BotCommand(command="owner", description="Owner paneli"), BotCommand(command="admin", description="Admin paneli"), BotCommand(command="backup", description="Zaxira olish")]
+        await bot.set_my_commands(owner_commands, scope=BotCommandScopeChat(chat_id=OWNER_ID))
+        for admin_id in set(ADMIN_IDS + [int(x) for x in data.get("admins", []) if str(x).isdigit()]):
+            if admin_id and admin_id != OWNER_ID:
+                await bot.set_my_commands([BotCommand(command="start", description="Botni boshlash"), BotCommand(command="admin", description="Admin paneli")], scope=BotCommandScopeChat(chat_id=admin_id))
         await dp.start_polling(bot)
     finally:
         await runner.cleanup()
